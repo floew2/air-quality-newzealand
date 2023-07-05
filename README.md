@@ -1,9 +1,3 @@
----
-editor_options: 
-  markdown: 
-    wrap: 72
----
-
 # Analyse air quality data
 
 Project **Analyse air quality data** based on air measurements in New
