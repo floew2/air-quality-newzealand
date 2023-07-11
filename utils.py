@@ -6,10 +6,10 @@ Date: June 2023
 '''
 
 import re
+import json
+
 from datetime import datetime
-from sklearn.metrics import mean_absolute_error
 import math
-from sklearn.model_selection import train_test_split
 from collections import defaultdict
 from typing import List
 import numpy as np
@@ -18,6 +18,14 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import seaborn as sns
 import warnings
+
+from sklearn.metrics import mean_absolute_error
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error
+
+from shapely.geometry import shape, Point, Polygon
+import geopandas as gpd
 
 import tensorflow as tf
 from tensorflow import keras
@@ -30,13 +38,15 @@ from ipywidgets import interact
 import folium
 from colour import Color
 
+from typing import List, Tuple, Dict, Any, Optional
+
 # This is a list of categorical variables
 categorical_variables = ['Station']
 
 FONT_SIZE_TICKS = 12
 FONT_SIZE_TITLE = 20
 FONT_SIZE_AXES = 16
-
+FACTOR = 1.032
 
 # Function to convert dataframe to datetime format and resamples to daily
 # records
@@ -380,12 +390,8 @@ def add_extra_features(df: pd.core.frame.DataFrame) -> pd.core.frame.DataFrame:
     stations = stations.rename(
         columns={
             'Station': 'Station',
-            'lat': 'Latitude',
-            'long': 'Longitude'})
-
-    # This cell will convert the values in the columns 'Latitud' and 'Longitud' to 'float64' (decimal) datatype
-    # stations['Latitude'] = stations['Latitude'].apply(parse_dms)
-    # stations['Longitude'] = stations['Longitude'].apply(parse_dms)
+            'lat': 'lat',
+            'long': 'long'})
 
     df = pd.merge(df, stations, on='Station', how='inner')
 
@@ -409,7 +415,7 @@ def create_map_with_plots(full_data: pd.core.frame.DataFrame,
 
     '''
 
-    data = full_data[['Latitude', 'Longitude',
+    data = full_data[['lat', 'long',
                       y_variable, 'Station', x_variable]]
     data_grouped = data.groupby(['Station', x_variable]).agg(
         ({y_variable: ['mean', 'std']}))
@@ -465,12 +471,12 @@ def create_map_with_plots(full_data: pd.core.frame.DataFrame,
         plt.clf()
 
     data_grouped_grid = data.groupby('Station').agg(
-        ({y_variable: 'mean', 'Latitude': 'min', 'Longitude': 'min'}))
+        ({y_variable: 'mean', 'lat': 'min', 'long': 'min'}))
 
     data_grouped_grid_array = np.array(
         [
-            data_grouped_grid['Latitude'].values,
-            data_grouped_grid['Longitude'].values,
+            data_grouped_grid['lat'].values,
+            data_grouped_grid['long'].values,
             data_grouped_grid[y_variable].values,
             data_grouped_grid.index.values
         ]
@@ -1035,3 +1041,303 @@ def impute_target_missing_values_neural_network(
     data_with_imputed = data_with_imputed[order_of_columns]
     
     return data_with_imputed
+
+def predict_on_airmeasurements(
+    model: KNeighborsRegressor,
+    n_points: int=64
+) -> Tuple[np.ndarray, float, float]:
+    ''' Creates a grid of predicted pollutant values based on the neighboring stations
+    
+    Args:
+        model (KNeighborsRegressor): Model to use
+        n_points (int): number of points in the grid
+        
+    Returns:
+        predictions_xy (np.ndarray): array containing tuples of coordinates and predicted value
+        dlat (float): latitude size of grid
+        dlon (float): longitudinal size of grid
+    '''
+    # Extract the shapes from the shapefile
+    polygon = gpd.read_file("data/Wellington_City_Council_Boundary/TLA_Boundaries.shp")
+
+    # Check if the shapefile is already in geographic coordinates
+    if polygon.crs.is_geographic:
+        print("Shapefile is already in geographic coordinates (WGS84).")
+    else:
+        # Project the shapefile to WGS84
+        polygon = polygon.to_crs("EPSG:4326")
+        print("Shapefile has been projected to WGS84 (latitude/longitude).")
+    
+    # Check each polygon to see if it contains the point
+    (lon_min, lat_min, lon_max, lat_max) = polygon.total_bounds
+
+    dlat = (lat_max - lat_min) / (n_points - 1)
+    dlon = (lon_max - lon_min) / (n_points - 1)
+    lat_values = np.linspace(lat_min - dlat, lat_max + dlat, n_points)
+    lon_values = np.linspace(lon_min - dlon, lon_max + dlon, n_points)
+    xv, yv = np.meshgrid(lat_values, lon_values, indexing='xy')
+
+    predictions_xy = []
+
+    for i in range(n_points):
+        row = [0] * n_points
+        for j in range(n_points):
+            if polygon.contains(Point(lon_values[j], lat_values[i])):
+                point = [lat_values[i], lon_values[j]]
+                # Remove the data of the same station
+                pred = model.predict([point])
+                predictions_xy.append([lat_values[i], lon_values[j], pred[0][0]])
+
+    predictions_xy = np.array(predictions_xy)
+    
+    return predictions_xy, dlat, dlon
+
+
+def create_heat_map(
+    predictions_xy,
+    df_day: datetime,
+    dlat: float,
+    dlon: float,
+    target_pollutant: str='PM2.5',
+    popup_plots: bool=False
+) -> folium.Map:
+    ''' Creates a heat map of predicted pollutant values based on the neighboring stations
+    
+    Args:
+        predictions_xy (np.ndarray): array containing tuples of coordinates and predicted value
+        df_day (datetime): the day for which to show the heatmap
+        dlat (float): latitude size of grid
+        dlon (float): longitudinal size of grid
+        target_pollutant (str): pollutant for which to show the heatmap
+        popup_plots (bool): Flag whether to show plots on popup or not
+
+    Returns:
+        map_hooray (folium.Map): Heatmap on the map.
+    '''
+    # Create the map
+    lat_center = np.average(predictions_xy[:,0])
+    lon_center = np.average(predictions_xy[:,1])
+
+    map_hooray = folium.Map(location=[lat_center, lon_center], zoom_start = 11) 
+
+    # List comprehension to make out list of lists
+    predictions = predictions_xy
+    heat_data = predictions
+    ymin = np.min(predictions[:,2])
+    ymax = np.max(predictions[:,2])
+
+    max_value_color = 50
+    
+    # Create rectangle features for the map to show the interpolated pollution between the stations
+    for row in heat_data:
+        color = color_producer(target_pollutant, row[2])
+        folium.Rectangle(
+            bounds=[
+                (row[0] - dlat * FACTOR / 2, row[1] - dlon * FACTOR / 2),
+                (row[0] + dlat * FACTOR / 2, row[1] + dlon * FACTOR / 2)
+            ],
+            color=color,
+            stroke=False,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.5,
+            popup=f'{"{:.2f}".format(row[2])}'
+        ).add_to(map_hooray)
+    
+    # Create circle features for the map to show stations
+    fg = folium.FeatureGroup(name='Stations')
+    for index, station in df_day.iterrows():
+        imputed_col =  f'{target_pollutant}_imputed_flag'
+        if imputed_col in station and type(station[imputed_col]) == str:
+            bg_color = 'black'
+            interpolated = f"\nestimated"
+        else:
+            bg_color = 'white'
+            interpolated = ''
+        if popup_plots:
+            popup_text = f"<img src='img/tmp/{station['Station']}.png'>"
+        else:
+            popup_text = f"{station['Station']}:\n{'{:.2f}'.format(station[target_pollutant])}{interpolated}"
+        fg.add_child(
+            folium.CircleMarker(
+                location=[station['lat'], station['long']],
+                radius = 11,
+                fill_color=bg_color,
+                color = '',
+                fill_opacity=0.9,
+            )
+        )
+        fg.add_child(
+            folium.CircleMarker(
+                location=[station['lat'], station['long']],
+                radius = 10,
+                fill_color=color_producer(target_pollutant, station[target_pollutant]),
+                color = '',
+                fill_opacity=0.9,
+                popup=popup_text
+            )
+        )
+    map_hooray.add_child(fg)
+
+    return map_hooray
+
+    
+def calculate_mae_for_k(
+    data: pd.core.frame.DataFrame,
+    k: int=1,
+    target_pollutant: str='PM2.5'
+) -> float:
+    ''' Calculates the MAE for k nearest neighbors
+    
+    Args:
+        data (pd.core.frame.DataFrame): dataframe with data.
+        k (int): number of neighbors to use for interpolation
+        target_pollutant (str): pollutant for which to show the heatmap
+
+    Returns:
+        MAE (float): The MAE value
+    '''    
+    # Drop all the rows with the stations where the data imputation didnt perform well
+    bad_stations = ['7MA', 'CSE', 'COL', 'MOV2']
+    df2 = data.drop(data[data['Station'].isin(bad_stations)].index)
+
+    # Drop all the rows where there is imputed data, so the calculation is only done on real data
+    # df2 = data[data[[c for c in data.columns if 'flag' in c]].isnull().all(axis=1)]
+    
+    # Take a sample of the data (so that the notebook runs faster)
+    df2 = df2.sample(frac=0.2, random_state=8765)
+    df2.insert(0, 'time_discriminator', (df2['DateTime'].dt.dayofyear * 10000 + df2['DateTime'].dt.hour * 100).values, True)
+    
+    predictions = []
+    stations = data['Station'].unique()
+    for station in stations:
+        df_day_station = df2.loc[df2['Station'] == station]
+        if len(df_day_station) > 0:
+            df_day_no_station = df2.loc[df2['Station'] != station]
+            if len(df_day_no_station) >= k:
+                neigh = KNeighborsRegressor(n_neighbors=k, weights = 'distance', metric='sqeuclidean')
+                knn_model = neigh.fit(
+                    df_day_no_station[['lat', 'long', 'time_discriminator']],
+                    df_day_no_station[[target_pollutant]]
+                )
+                prediction = knn_model.predict(df_day_station[['lat', 'long', 'time_discriminator']])
+                if len(predictions)==0:
+                    predictions = np.array([df_day_station[target_pollutant].values, prediction[:,0]]).T
+                else:
+                    predictions = np.concatenate(
+                        (predictions, np.array([df_day_station[target_pollutant].values, prediction[:,0]]).T),
+                        axis=0
+                    )
+
+    predictions = np.array(predictions)
+    MAE = mean_absolute_error(predictions[:,0],predictions[:,1])
+    
+    return MAE
+
+
+def create_heat_map_with_date_range(
+    df: pd.core.frame.DataFrame,
+    start_date: datetime,
+    end_date: datetime,
+    k_neighbors: int=1,
+    target_pollutant: str='PM2.5',
+    distance_metric: str='sqeuclidean'
+) -> folium.Map:
+    ''' Creates a heat map of predicted pollutant values based on the neighboring stations
+    
+    Args:
+        df (pd.core.frame.DataFrame): dataframe with data.
+        start_date (datetime): the starting day for which to show the heatmap
+        end_date (datetime): the end day for which to show the heatmap
+        k_neighbors (int): number of neighbors to use for interpolation
+        target_pollutant (str): pollutant for which to show the heatmap
+        distance_metric (str): The metric to use to calculate the distance between the stations.
+
+    Returns:
+        map_hooray (folium.Map): Heatmap on the map.
+    '''
+    df_days = df[df['DateTime'] >= start_date]
+    df_days = df_days[df_days['DateTime'] <= end_date]
+
+    for key in df_days.Station.unique():
+        dates = df_days[df_days['Station']==key]['DateTime']
+        plt.plot(dates, df_days[df_days['Station']==key][target_pollutant], '-o')
+        plt.plot(dates, [12] * len(dates),'--g', label='recommended level')
+        plt.title(f'Station {key}')
+        plt.xlabel('hour')
+        plt.ylabel(f'{target_pollutant} concentration')
+        plt.legend(loc='upper left')
+        plt.xticks(rotation=30)
+        plt.savefig(f'img/tmp/{key}.png')
+        plt.clf()
+
+    k = k_neighbors
+    neigh = KNeighborsRegressor(n_neighbors=k, weights = 'distance', metric=distance_metric)
+    # Filter a single time step
+    df_day = df_days[df_days['DateTime'] == end_date]
+    neigh.fit(df_day[['lat', 'long']], df_day[[target_pollutant]])
+
+    predictions_xy, dlat, dlon = predict_on_airmeasurements(neigh, 64)
+
+    map_hooray = create_heat_map(predictions_xy, df_day, dlat, dlon, target_pollutant, popup_plots=True)
+
+    return map_hooray
+
+
+def create_animation_features(
+    df: pd.core.frame.DataFrame,
+    start_date: datetime,
+    end_date: datetime,
+    k: int,
+    n_points: int,
+    target_pollutant='PM2.5'
+) -> List[Dict[str, Any]]:
+    ''' Creates features to put on the animated map
+    
+    Args:
+        df (pd.core.frame.DataFrame): dataframe with data.
+        start_date (datetime): the starting day for which to show the heatmap
+        end_date (datetime): the end day for which to show the heatmap
+        k (int): number of neighbors to use for interpolation
+        n_points (int): number of points in the grid
+        target_pollutant (str): pollutant for which to show the heatmap
+
+    Returns:
+        features (List[Dict[str, Any]]): List of features.
+    '''
+    # Select the date range from the full dataframe
+    df_days = df[df['DateTime'] >= start_date]
+    df_days = df_days[df_days['DateTime'] <= end_date]
+    # Take all the unique dates (steps for the animation)
+    unique_dates = df_days['DateTime'].unique()
+    # Select only relevant columns
+    df_days = df_days[['DateTime', 'Station', 'lat', 'long', target_pollutant]]
+    # Create a list to store all of the features (elements) of the animation
+    features = []
+
+    k_neighbors_model = KNeighborsRegressor(n_neighbors=k, weights='distance', metric='sqeuclidean')
+
+    for timestamp in unique_dates:
+        df_day = df[df['DateTime'] == timestamp]
+
+        day_hour = str(timestamp)[0:19]
+        k_neighbors_model.fit(df_day[['lat', 'long']], df_day[[target_pollutant]])
+        predictions_xy, dlat, dlon = predict_on_airmeasurements(k_neighbors_model, n_points)
+
+        for row in predictions_xy:
+            rect = create_polygon(row, dlat, dlon, day_hour, target_pollutant)
+            features.append(rect)
+
+        for index, station in df_day.iterrows():
+            imputed_col =  f'{target_pollutant}_imputed_flag'
+            if imputed_col in station and type(station[imputed_col]) == str:
+                bg_color = 'black'
+            else:
+                bg_color = 'white'
+            data = [station['lat'], station['long'], station[target_pollutant]]
+            circle = create_circle(data, day_hour, 13, target_pollutant, bg_color)
+            features.append(circle)
+            circle = create_circle(data, day_hour, 12, target_pollutant)
+            features.append(circle)
+    
+    return features
